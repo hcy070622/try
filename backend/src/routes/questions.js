@@ -1,50 +1,48 @@
 import { Router } from 'express';
 import { db } from '../db.js';
 import { authMiddleware } from '../auth.js';
-import { generateQuestionsForCourse } from '../questionGenerator.js';
+import { generateQuestionsForCourse, DIFFICULTIES, MAX_QUESTIONS } from '../questionGenerator.js';
+import { ownCourseMiddleware } from '../access.js';
+import { ai } from '../ai.js';
 
 const router = Router();
 router.use(authMiddleware);
 
-function isMember(userId, classId) {
-  return !!db.prepare('SELECT id FROM class_members WHERE class_id = ? AND user_id = ?').get(classId, userId);
-}
-
-router.post('/generate/:courseId', (req, res) => {
-  const courseId = Number(req.params.courseId);
-  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(courseId);
-  if (!course) return res.status(404).json({ error: '课程不存在' });
-  if (!isMember(req.user.id, course.class_id)) {
-    return res.status(403).json({ error: '无权访问该课程' });
+router.post('/generate/:courseId', ownCourseMiddleware, async (req, res) => {
+  const { difficulty, count, replace } = req.body || {};
+  if (difficulty != null && !DIFFICULTIES.includes(difficulty)) {
+    return res.status(400).json({ error: `难度只能是 ${DIFFICULTIES.join(' / ')}` });
   }
+  if (count != null && (!Number.isInteger(Number(count)) || Number(count) < 1 || Number(count) > MAX_QUESTIONS)) {
+    return res.status(400).json({ error: `题目数量应为 1-${MAX_QUESTIONS}` });
+  }
+
   try {
-    const questions = generateQuestionsForCourse(courseId);
-    res.status(201).json(questions);
+    const result = await generateQuestionsForCourse(req.course.id, {
+      ai,
+      userId: req.user.id,
+      difficulty: difficulty || 'basic',
+      count: Number(count) || 5,
+      replace: Boolean(replace)
+    });
+    res.status(201).json({
+      ...result,
+      aiConfigured: Boolean(ai.configured)
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-router.get('/:courseId', (req, res) => {
-  const courseId = Number(req.params.courseId);
-  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(courseId);
-  if (!course) return res.status(404).json({ error: '课程不存在' });
-  if (!isMember(req.user.id, course.class_id)) {
-    return res.status(403).json({ error: '无权访问该课程' });
-  }
+router.get('/:courseId', ownCourseMiddleware, (req, res) => {
   const questions = db
     .prepare('SELECT * FROM questions WHERE course_id = ? ORDER BY id')
-    .all(courseId);
+    .all(req.course.id);
   res.json(questions);
 });
 
-router.delete('/:courseId', (req, res) => {
-  if (req.user.role !== 'teacher') {
-    return res.status(403).json({ error: '只有老师可以删除习题' });
-  }
-  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(Number(req.params.courseId));
-  if (!course) return res.status(404).json({ error: '课程不存在' });
-  db.prepare('DELETE FROM questions WHERE course_id = ?').run(course.id);
+router.delete('/:courseId', ownCourseMiddleware, (req, res) => {
+  db.prepare('DELETE FROM questions WHERE course_id = ?').run(req.course.id);
   res.json({ ok: true });
 });
 

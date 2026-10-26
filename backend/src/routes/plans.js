@@ -1,23 +1,11 @@
 import { Router } from 'express';
 import { db } from '../db.js';
 import { authMiddleware } from '../auth.js';
+import { ownCourseMiddleware } from '../access.js';
+import { ai } from '../ai.js';
 
 const router = Router();
 router.use(authMiddleware);
-
-function isMember(userId, classId) {
-  return !!db.prepare('SELECT id FROM class_members WHERE class_id = ? AND user_id = ?').get(classId, userId);
-}
-
-function checkCourse(req, res, next) {
-  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(Number(req.params.courseId));
-  if (!course) return res.status(404).json({ error: '课程不存在' });
-  if (!isMember(req.user.id, course.class_id)) {
-    return res.status(403).json({ error: '无权访问该课程' });
-  }
-  req.course = course;
-  next();
-}
 
 const STOPWORDS = /(的|了|和|是|在|与|及|或|都|也|就|很|而|因为|所以|但是|以及|可以|我们|你们|他们|这个|那个|关于|什么|如何|为什么|进行|具有|包括|以及)/g;
 
@@ -112,7 +100,7 @@ function emptyState(preview, review, practice) {
   });
 }
 
-router.get('/:courseId', checkCourse, (req, res) => {
+router.get('/:courseId', ownCourseMiddleware, (req, res) => {
   let plan = db
     .prepare('SELECT * FROM study_plans WHERE course_id = ? AND user_id = ?')
     .get(req.course.id, req.user.id);
@@ -124,7 +112,7 @@ router.get('/:courseId', checkCourse, (req, res) => {
   res.json(plan || null);
 });
 
-router.put('/state/:courseId', checkCourse, (req, res) => {
+router.put('/state/:courseId', ownCourseMiddleware, (req, res) => {
   const { state } = req.body || {};
   const existing = db
     .prepare('SELECT * FROM study_plans WHERE course_id = ? AND user_id = ?')
@@ -144,24 +132,65 @@ router.put('/state/:courseId', checkCourse, (req, res) => {
   res.json(saved);
 });
 
-router.post('/generate/:courseId', checkCourse, (req, res) => {
+router.post('/generate/:courseId', ownCourseMiddleware, async (req, res) => {
   try {
-    const plan = buildPlan(req.course);
+    const questions = db.prepare('SELECT question, answer FROM questions WHERE course_id = ?').all(req.course.id);
+    const recordings = db.prepare('SELECT transcript FROM recordings WHERE course_id = ?').all(req.course.id);
+    const transcript = recordings.map((r) => r.transcript).filter(Boolean).join('\n');
+    const attempts = db
+      .prepare(
+        `SELECT score, max_score, created_at FROM quiz_attempts
+          WHERE course_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 5`
+      )
+      .all(req.course.id, req.user.id);
+    const wrongs = db
+      .prepare(
+        `SELECT content, my_answer, correct_answer FROM wrong_questions
+          WHERE course_id = ? AND created_by = ? ORDER BY created_at DESC LIMIT 10`
+      )
+      .all(req.course.id, req.user.id);
+
+    let plan = null;
+    let engine = 'rule';
+    let degraded = false;
+    let error = null;
+
+    if (ai.configured) {
+      try {
+        const result = await ai.buildPlan({
+          course: req.course,
+          transcript,
+          questions,
+          attempts,
+          wrongs,
+          userId: req.user.id
+        });
+        plan = result.data;
+        engine = 'llm';
+      } catch (e) {
+        degraded = true;
+        error = e.message;
+      }
+    }
+
+    if (!plan) plan = buildPlan(req.course);
+
     const state = emptyState(plan.preview, plan.review, plan.practice);
     db.prepare(
-      `INSERT INTO study_plans (course_id, user_id, preview, review, practice, state, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+      `INSERT INTO study_plans (course_id, user_id, preview, review, practice, state, engine, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
        ON CONFLICT(course_id, user_id) DO UPDATE SET
          preview = excluded.preview,
          review = excluded.review,
          practice = excluded.practice,
          state = excluded.state,
+         engine = excluded.engine,
          updated_at = datetime('now')`
-    ).run(req.course.id, req.user.id, plan.preview, plan.review, plan.practice, state);
+    ).run(req.course.id, req.user.id, plan.preview, plan.review, plan.practice, state, engine);
     const saved = db
       .prepare('SELECT * FROM study_plans WHERE course_id = ? AND user_id = ?')
       .get(req.course.id, req.user.id);
-    res.json(saved);
+    res.json({ ...saved, degraded, degradedReason: error, focus: plan.focus || [] });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

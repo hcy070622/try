@@ -2,15 +2,13 @@ import { Router } from 'express';
 import multer from 'multer';
 import { db, storageDir } from '../db.js';
 import { authMiddleware } from '../auth.js';
+import { ownCourseMiddleware } from '../access.js';
 import { join, extname } from 'node:path';
 import crypto from 'node:crypto';
+import { AUDIO_MIME_BY_EXT } from '../asr/config.js';
 
 const router = Router();
 router.use(authMiddleware);
-
-function isMember(userId, classId) {
-  return !!db.prepare('SELECT id FROM class_members WHERE class_id = ? AND user_id = ?').get(classId, userId);
-}
 
 function randName(original) {
   const ext = extname(original || '').toLowerCase();
@@ -24,8 +22,23 @@ const audioUpload = multer({
   }),
   limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['audio/webm', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/ogg'];
-    if (allowed.includes(file.mimetype)) {
+    const allowedMimes = [
+      'audio/webm',
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/mp4',
+      'audio/x-m4a',
+      'audio/wav',
+      'audio/x-wav',
+      'audio/ogg',
+      'audio/aac',
+      'audio/flac',
+      // 浏览器 MediaRecorder 生成的 webm 有时会被标记为 video/webm
+      'video/webm'
+    ];
+    const allowedExts = Object.keys(AUDIO_MIME_BY_EXT);
+    const ext = extname(file.originalname || '').toLowerCase();
+    if (allowedMimes.includes(file.mimetype) || allowedExts.includes(ext)) {
       cb(null, true);
     } else {
       cb(new Error('只允许上传音频文件'));
@@ -49,31 +62,25 @@ const imageUpload = multer({
   }
 });
 
-function checkCourse(req, res, next) {
-  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(Number(req.params.courseId || req.body.course_id));
-  if (!course) return res.status(404).json({ error: '课程不存在' });
-  if (!isMember(req.user.id, course.class_id)) {
-    return res.status(403).json({ error: '无权访问该课程' });
-  }
-  req.course = course;
-  next();
-}
-
-router.post('/audios/:courseId', checkCourse, audioUpload.single('file'), (req, res) => {
+router.post('/audios/:courseId', ownCourseMiddleware, audioUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: '未收到录音文件' });
+  const duration = req.body.duration == null || req.body.duration === '' ? null : Number(req.body.duration);
+  if (duration !== null && (!Number.isFinite(duration) || duration < 0 || duration > 8 * 60 * 60)) {
+    return res.status(400).json({ error: '录音时长不合法' });
+  }
   const info = db
     .prepare('INSERT INTO recordings (course_id, filename, storage, duration, size, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(req.course.id, req.file.filename, req.file.filename, req.body.duration ? Number(req.body.duration) : null, req.file.size, req.user.id);
+    .run(req.course.id, req.file.filename, req.file.filename, duration, req.file.size, req.user.id);
   res.status(201).json({
     id: Number(info.lastInsertRowid),
     filename: req.file.filename,
     storage: `/files/audios/${req.file.filename}`,
-    duration: req.body.duration ? Number(req.body.duration) : null,
+    duration,
     size: req.file.size
   });
 });
 
-router.post('/images/:courseId', checkCourse, imageUpload.single('file'), (req, res) => {
+router.post('/images/:courseId', ownCourseMiddleware, imageUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: '未收到图片文件' });
   const info = db
     .prepare('INSERT INTO images (course_id, filename, storage, size, uploaded_by) VALUES (?, ?, ?, ?, ?)')
